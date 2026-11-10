@@ -1,9 +1,16 @@
 {
   "name": "chrome-launcher",
   "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "type": "module",
   "engines": {
-    "node": ">=16"
+    "node": ">=22.12.0"
   },
   "scripts": {
     "build": "tsc",
@@ -22,15 +29,11 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
-    "@types/sinon": "^22.0.2",
     "clang-format": "^1.8.0",
-    "sinon": "^22.1.0",
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "escape-string-regexp": "^5.0.0",
-    "is-wsl": "^3.1.1",
-    "lighthouse-logger": "^2.0.2"
+    "is-wsl": "^3.1.1"
   },
   "peerDependencies": {
     "@types/node": "*"

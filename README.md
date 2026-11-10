@@ -72,9 +72,16 @@ npm install chrome-launcher
   // Default: `about:blank`
   startingUrl: string;
 
-  // (optional) Logging level
-  // Default: 'silent'
-  logLevel: 'verbose'|'info'|'error'|'silent';
+  // (optional) Receives the launcher's log messages. `console` works.
+  // Default: silent, unless the NODE_DEBUG environment variable enables it:
+  //   NODE_DEBUG=chrome-launcher     info, warnings and errors on stderr
+  //   NODE_DEBUG='chrome-launcher*'  the above plus debug messages
+  logger: {
+    debug(message: string): void;
+    info(message: string): void;
+    warn(message: string): void;
+    error(message: string): void;
+  };
 
   // (optional) Flags specific in [flags.ts](src/flags.ts) will not be included.
   // Typically used with the defaultFlags() method and chromeFlags option.
@@ -104,6 +111,10 @@ chrome.port: number;
 
 // Method to kill Chrome (and cleanup the profile folder)
 chrome.kill: () => Promise<void>;
+
+// Same as kill(). Lets `using chrome = await launch()` clean up on scope exit
+// (TypeScript 5.2+, or natively from Node 24).
+chrome[Symbol.dispose]: () => void;
 
 // The process id
 chrome.pid: number;

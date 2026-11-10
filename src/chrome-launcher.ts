@@ -4,15 +4,16 @@
  * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
 
-import * as childProcess from 'child_process';
-import {ChildProcess, spawn, spawnSync} from 'child_process';
-import * as fs from 'fs';
-import log from 'lighthouse-logger';
-import * as net from 'net';
+import * as childProcess from 'node:child_process';
+import {ChildProcess, spawn, spawnSync} from 'node:child_process';
+import * as fs from 'node:fs';
+import * as net from 'node:net';
+import {setTimeout as delay} from 'node:timers/promises';
 
 import * as chromeFinder from './chrome-finder.js';
 import {DEFAULT_FLAGS} from './flags.js';
-import {ChromeNotInstalledError, defaults, delay, getErrorMessage, getPlatform, InvalidUserDataDirectoryError, makeTmpDir, toWin32Path, UnsupportedPlatformError} from './utils.js';
+import {defaultLogger, type Logger} from './log.js';
+import {ChromeNotInstalledError, getErrorMessage, getPlatform, InvalidUserDataDirectoryError, makeTmpDir, toWin32Path, UnsupportedPlatformError} from './utils.js';
 
 const isWsl = getPlatform() === 'wsl';
 const isWindows = getPlatform() === 'win32';
@@ -41,7 +42,7 @@ export interface Options {
   handleSIGINT?: boolean;
   chromePath?: string;
   userDataDir?: string|boolean;
-  logLevel?: 'verbose'|'info'|'error'|'warn'|'silent';
+  logger?: Logger;
   ignoreDefaultFlags?: boolean;
   connectionPollInterval?: number;
   maxConnectionRetries?: number;
@@ -58,6 +59,8 @@ export interface LaunchedChrome {
   process: ChildProcess;
   remoteDebuggingPipes: RemoteDebuggingPipes|null;
   kill: () => void;
+  /** Kills Chrome, so that `using chrome = await launch()` cleans up on scope exit. */
+  [Symbol.dispose]: () => void;
 }
 
 export interface ModuleOverrides {
@@ -84,7 +87,7 @@ function unlistenForTermination() {
 }
 
 async function launch(opts: Options = {}): Promise<LaunchedChrome> {
-  opts.handleSIGINT = defaults(opts.handleSIGINT, true);
+  opts.handleSIGINT ??= true;
 
   const instance = new Launcher(opts);
 
@@ -111,6 +114,7 @@ async function launch(opts: Options = {}): Promise<LaunchedChrome> {
     process: instance.chromeProcess!,
     remoteDebuggingPipes: instance.remoteDebuggingPipes,
     kill,
+    [Symbol.dispose]: kill,
   };
 }
 
@@ -157,6 +161,7 @@ class Launcher {
   private spawn: typeof childProcess.spawn;
   private useDefaultProfile: boolean;
   private envVars: {[key: string]: string|undefined};
+  private log: Logger;
 
   chromeProcess?: childProcess.ChildProcess;
   userDataDir?: string;
@@ -171,19 +176,19 @@ class Launcher {
     this.fs = moduleOverrides.fs || fs;
     this.spawn = moduleOverrides.spawn || spawn;
 
-    log.setLevel(defaults(this.opts.logLevel, 'silent'));
+    this.log = this.opts.logger ?? defaultLogger;
 
     // choose the first one (default)
-    this.startingUrl = defaults(this.opts.startingUrl, 'about:blank');
-    this.chromeFlags = defaults(this.opts.chromeFlags, []);
-    this.prefs = defaults(this.opts.prefs, {});
-    this.requestedPort = defaults(this.opts.port, 0);
+    this.startingUrl = this.opts.startingUrl ?? 'about:blank';
+    this.chromeFlags = this.opts.chromeFlags ?? [];
+    this.prefs = this.opts.prefs ?? {};
+    this.requestedPort = this.opts.port ?? 0;
     this.portStrictMode = opts.portStrictMode;
     this.chromePath = this.opts.chromePath;
-    this.ignoreDefaultFlags = defaults(this.opts.ignoreDefaultFlags, false);
-    this.connectionPollInterval = defaults(this.opts.connectionPollInterval, 500);
-    this.maxConnectionRetries = defaults(this.opts.maxConnectionRetries, 50);
-    this.envVars = defaults(opts.envVars, Object.assign({}, process.env));
+    this.ignoreDefaultFlags = this.opts.ignoreDefaultFlags ?? false;
+    this.connectionPollInterval = this.opts.connectionPollInterval ?? 500;
+    this.maxConnectionRetries = this.opts.maxConnectionRetries ?? 50;
+    this.envVars = opts.envVars ?? {...process.env};
 
     if (typeof this.opts.userDataDir === 'boolean') {
       if (!this.opts.userDataDir) {
@@ -265,7 +270,7 @@ class Launcher {
 
     this.pidFile = `${this.userDataDir}/chrome.pid`;
 
-    log.verbose('ChromeLauncher', `created ${this.userDataDir}`);
+    this.log.debug(`created ${this.userDataDir}`);
 
     this.tmpDirandPidFileReady = true;
   }
@@ -293,7 +298,7 @@ class Launcher {
         this.fs.writeFileSync(preferenceFile, JSON.stringify({...this.prefs}), 'utf-8');
       }
     } catch (err) {
-      log.log('ChromeLauncher', `Failed to set browser prefs: ${getErrorMessage(err)}`);
+      this.log.info(`Failed to set browser prefs: ${getErrorMessage(err)}`);
     }
   }
 
@@ -304,18 +309,14 @@ class Launcher {
       // If an explict port is passed first look for an open connection...
       try {
         await this.isDebuggerReady();
-        log.log(
-            'ChromeLauncher',
-            `Found existing Chrome already running using port ${this.port}, using that.`);
+        this.log.info(`Found existing Chrome already running using port ${this.port}, using that.`);
         return;
       } catch {
         if (this.portStrictMode) {
           throw new Error(`found no Chrome at port ${this.requestedPort}`);
         }
 
-        log.log(
-            'ChromeLauncher',
-            `No debugging port found on port ${this.port}, launching a new Chrome.`);
+        this.log.info(`No debugging port found on port ${this.port}, launching a new Chrome.`);
       }
     }
     if (this.chromePath === undefined) {
@@ -337,7 +338,7 @@ class Launcher {
   private async spawnProcess(execPath: string) {
     const spawnPromise = (async () => {
       if (this.chromeProcess) {
-        log.log('ChromeLauncher', `Chrome already running with pid ${this.chromeProcess.pid}.`);
+        this.log.info(`Chrome already running with pid ${this.chromeProcess.pid}.`);
         return this.chromeProcess.pid;
       }
 
@@ -348,8 +349,7 @@ class Launcher {
         this.port = 0;
       }
 
-      log.verbose(
-          'ChromeLauncher', `Launching with command:\n"${execPath}" ${this.flags.join(' ')}`);
+      this.log.debug(`Launching with command:\n"${execPath}" ${this.flags.join(' ')}`);
       this.chromeProcess = this.spawn(execPath, this.flags, {
         // On non-windows platforms, `detached: true` makes child process a leader of a new
         // process group, making it possible to kill child process tree with `.kill(-pid)` command.
@@ -371,9 +371,7 @@ class Launcher {
         };
       }
 
-      log.verbose(
-          'ChromeLauncher',
-          `Chrome running with pid ${this.chromeProcess.pid} on port ${this.port}.`);
+      this.log.debug(`Chrome running with pid ${this.chromeProcess.pid} on port ${this.port}.`);
       return this.chromeProcess.pid;
     })();
 
@@ -414,14 +412,9 @@ class Launcher {
 
   // The log is append-only, so the last listening line is the current launch.
   private debuggingPortFromStderr(stderr: string): number|undefined {
-    const pattern = /DevTools listening on ws:\/\/.*?:(\d+)\//g;
-    let port: number|undefined;
-    let match: RegExpExecArray|null = pattern.exec(stderr);
-    while (match) {
-      port = parseInt(match[1], 10);
-      match = pattern.exec(stderr);
-    }
-    return port;
+    const matches = [...stderr.matchAll(/DevTools listening on ws:\/\/.*?:(\d+)\//g)];
+    const last = matches.at(-1);
+    return last ? parseInt(last[1], 10) : undefined;
   }
 
   // resolves if ready, rejects otherwise
@@ -443,69 +436,56 @@ class Launcher {
     });
   }
 
-  // resolves when debugger is ready, rejects after 10 polls
-  waitUntilReady() {
-    const launcher = this;
-
-    return new Promise<void>((resolve, reject) => {
-      let retries = 0;
-      let waitStatus = 'Waiting for browser.';
-
-      const poll = () => {
-        if (retries === 0) {
-          log.log('ChromeLauncher', waitStatus);
+  // Reads the dynamic port from chrome-err.log if needed, then probes it.
+  private async checkReady(): Promise<void> {
+    if (this.port === 0) {
+      try {
+        const port = this.debuggingPortFromStderr(this.readChromeStderr());
+        if (port !== undefined) {
+          this.port = port;
+          this.log.debug(`Discovered Chrome listening on port ${this.port}.`);
         }
-        retries++;
-        waitStatus += '..';
-        log.log('ChromeLauncher', waitStatus);
+      } catch {
+        // Ignore read errors until retries expire
+      }
+    }
 
-        const checkReady = () => {
-          if (launcher.port === 0) {
-            try {
-              const stderr = launcher.readChromeStderr();
-              const port = launcher.debuggingPortFromStderr(stderr);
-              if (port !== undefined) {
-                launcher.port = port;
-                log.verbose(
-                    'ChromeLauncher', `Discovered Chrome listening on port ${launcher.port}.`);
-              }
-            } catch {
-              // Ignore read errors until retries expire
-            }
+    if (this.port === 0) {
+      throw new Error('waiting for dynamic debugging port in chrome-err.log');
+    }
+
+    await this.isDebuggerReady();
+  }
+
+  // resolves when debugger is ready, rejects once maxConnectionRetries is exceeded
+  async waitUntilReady(): Promise<void> {
+    let waitStatus = 'Waiting for browser.';
+    this.log.info(waitStatus);
+
+    for (let retries = 1;; retries++) {
+      waitStatus += '..';
+      this.log.info(waitStatus);
+
+      try {
+        await this.checkReady();
+        this.log.info(waitStatus + (isWindows ? '\u221A' : '✓'));
+        return;
+      } catch (err) {
+        if (retries > this.maxConnectionRetries) {
+          this.log.error(getErrorMessage(err));
+          let stderr = '';
+          try {
+            stderr = this.readChromeStderr();
+          } catch (readErr) {
+            stderr = `Failed to read log: ${getErrorMessage(readErr)}`;
           }
-
-          if (launcher.port === 0) {
-            return Promise.reject(
-                new Error('waiting for dynamic debugging port in chrome-err.log'));
-          }
-
-          return launcher.isDebuggerReady();
-        };
-
-        checkReady()
-            .then(() => {
-              log.log('ChromeLauncher', waitStatus + `${log.greenify(log.tick)}`);
-              resolve();
-            })
-            .catch(err => {
-              if (retries > launcher.maxConnectionRetries) {
-                log.error('ChromeLauncher', err.message);
-                let stderr = '';
-                try {
-                  stderr = launcher.readChromeStderr();
-                } catch (readErr) {
-                  stderr = `Failed to read log: ${getErrorMessage(readErr)}`;
-                }
-                log.error(
-                    'ChromeLauncher', `Logging contents of ${this.userDataDir}/chrome-err.log`);
-                log.error('ChromeLauncher', stderr);
-                return reject(err);
-              }
-              delay(launcher.connectionPollInterval).then(poll);
-            });
-      };
-      poll();
-    });
+          this.log.error(`Logging contents of ${this.userDataDir}/chrome-err.log`);
+          this.log.error(stderr);
+          throw err;
+        }
+        await delay(this.connectionPollInterval);
+      }
+    }
   }
 
   kill() {
@@ -518,15 +498,15 @@ class Launcher {
       this.destroyTmp();
     });
 
-    log.log('ChromeLauncher', `Killing Chrome instance ${this.chromeProcess.pid}`);
+    this.log.info(`Killing Chrome instance ${this.chromeProcess.pid}`);
     try {
       if (isWindows) {
         // https://github.com/GoogleChrome/chrome-launcher/issues/266
         const taskkillProc = spawnSync(
-            `taskkill /pid ${this.chromeProcess.pid} /T /F`, {shell: true, encoding: 'utf-8'});
+            'taskkill', ['/pid', `${this.chromeProcess.pid}`, '/T', '/F'], {encoding: 'utf-8'});
 
         const {stderr} = taskkillProc;
-        if (stderr) log.error('ChromeLauncher', `taskkill stderr`, stderr);
+        if (stderr) this.log.error(`taskkill stderr ${stderr}`);
       } else {
         if (this.chromeProcess.pid) {
           process.kill(-this.chromeProcess.pid, 'SIGKILL');
@@ -534,7 +514,7 @@ class Launcher {
       }
     } catch (err) {
       const message = `Chrome could not be killed ${getErrorMessage(err)}`;
-      log.warn('ChromeLauncher', message);
+      this.log.warn(message);
     }
     this.destroyTmp();
   }
@@ -565,8 +545,7 @@ class Launcher {
       this.fs.rmSync(
           this.userDataDir, {recursive: true, force: true, maxRetries: 10, retryDelay: 250});
     } catch (err) {
-      log.warn(
-          'ChromeLauncher',
+      this.log.warn(
           `Could not delete temporary directory ${this.userDataDir}: ${getErrorMessage(err)}`);
     }
   }
@@ -574,3 +553,4 @@ class Launcher {
 
 export default Launcher;
 export {Launcher, launch, killAll, getChromePath};
+export type{Logger};
